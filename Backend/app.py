@@ -50,11 +50,10 @@ def normalize_experience(exp):
     if any(k in e for k in ["fresher","campus","intern","entry"]): return "Entry-level"
     return "Experienced"
 
-# JSON fence cleaner + extractor (stops ```json leaks)
 def _clean_json_text(raw: str) -> str:
     txt = (raw or "").strip()
-    txt = re.sub(r"^```(?:json)?\s*", "", txt, flags=re.IGNORECASE)  # leading fence
-    txt = re.sub(r"\s*```$", "", txt)                               # trailing fence
+    txt = re.sub(r"^```(?:json)?\s*", "", txt, flags=re.IGNORECASE)
+    txt = re.sub(r"\s*```$", "", txt)
     return txt
 
 def extract_json_object(raw: str):
@@ -70,7 +69,6 @@ def extract_json_object(raw: str):
 
 INTERVIEW_PHASES = {
     "welcome": {"questions": lambda exp: 1, "duration": 60, "description": "Greeting + self-intro"},
-    # changed to 10 / 15 like you wanted
     "conversation": {"questions": lambda exp: 10 if normalize_experience(exp) == "Entry-level" else 15, "duration": 900, "description": "Main discussion"},
     "closing": {"questions": lambda exp: 1, "duration": 60, "description": "Wrap-up"}
 }
@@ -83,7 +81,13 @@ INTERVIEWER_PERSONALITIES = {
     'arjun': {'name': 'Arjun', 'emoji': '👨🏽‍💼', 'style': 'calm and structured',   'openers': ["Hello, welcome.","Nice to meet you.","Thanks for joining in."], 'gender': 'male',   'accent': 'en-IN'}
 }
 
-LANGUAGES = {'English': {'code':'en'}, 'Hindi': {'code':'hi'}, 'Spanish': {'code':'es'}, 'French': {'code':'fr'}}
+# Region-aware codes for Google SR
+LANGUAGES = {
+    'English': {'code':'en-US'},
+    'Hindi':   {'code':'hi-IN'},
+    'Spanish': {'code':'es-ES'},
+    'French':  {'code':'fr-FR'}
+}
 
 TECH_DOMAINS_MASTER = ['DSA','OOP','OS','CN','DBMS','SE']
 TECH_DOMAIN_LABELS = {'DSA':'Data Structures & Algorithms','OOP':'Object-Oriented Programming','OS':'Operating Systems','CN':'Computer Networks','DBMS':'Database Management Systems','SE':'Software Engineering'}
@@ -171,6 +175,19 @@ def _global_preflight_ok():
         resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Gemini-Key, X-Gemini-Tech-Key'
         resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
         return resp
+
+# ---------- Language selection for SR ----------
+def lang_code_for_session(s):
+    # If user picked English, respect the interviewer accent (en-IN, en-GB, en-US)
+    selected = s.get('selected_language', 'English')
+    persona_key = s.get('interviewer_personality', 'sarah')
+    accent = INTERVIEWER_PERSONALITIES.get(persona_key, {}).get('accent', 'en-US')
+
+    if selected == 'English':
+        if accent in ('en-IN', 'en-GB', 'en-US'):
+            return accent
+        return 'en-US'
+    return LANGUAGES.get(selected, LANGUAGES['English'])['code']
 
 # ---------- Turn generators ----------
 def _choose_next_tech_domain(s):
@@ -310,6 +327,7 @@ Recent conversation (newest first):
 
 Candidate's last answer:
 \"\"\"{last_answer}\"\"\"
+
 
 - Topic: {domain_label}
 - Guidance: {domain_rule}
@@ -455,27 +473,42 @@ def calculate_enhanced_score(history):
     if len(answered)/len(history) >= 0.8: avg += 0.5
     return round(min(avg,10),1)
 
-def transcribe_audio(audio_data, language='en'):
+def transcribe_audio(audio_data, language='en-US'):
     rec = sr.Recognizer()
+    # More tolerant, mobile-friendly defaults
+    rec.dynamic_energy_threshold = True
+    rec.energy_threshold = 250
+
     try:
         if isinstance(audio_data, str):
-            if ',' in audio_data: audio_data = audio_data.split(',')[1]
+            if ',' in audio_data:
+                audio_data = audio_data.split(',')[1]
             audio_bytes = base64.b64decode(audio_data)
         else:
             audio_bytes = audio_data
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            tmp.write(audio_bytes); tmp_path = tmp.name
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
         try:
             with sr.AudioFile(tmp_path) as source:
-                rec.adjust_for_ambient_noise(source, duration=0.2)
+                # Slightly longer calibration helps noise/room correction
+                rec.adjust_for_ambient_noise(source, duration=0.4)
                 audio = rec.record(source)
-            try: return rec.recognize_google(audio, language=language)
-            except: return ""
+            try:
+                return rec.recognize_google(audio, language=language)
+            except Exception as e:
+                logger.warning(f"Google SR failed: {e}")
+                return ""
         finally:
-            try: os.unlink(tmp_path)
-            except: pass
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
     except Exception as e:
-        logger.error(f"ASR error: {e}"); return ""
+        logger.error(f"ASR error: {e}")
+        return ""
 
 # ---------- Shared handlers ----------
 def start_interview_core(data, mode):
@@ -486,7 +519,6 @@ def start_interview_core(data, mode):
     s=sessions[sid]
     if s['mode'] != mode: return {'error':'Session mode mismatch'}, 400
 
-    # BYOK enforcement
     if require_key_for(mode):
         key = _resolve_key(sid, which='tech' if mode=='tech' else 'normal')
         if not key: return {'error': 'API key required. Please paste your Gemini key in the setup screen.'}, 400
@@ -527,8 +559,8 @@ def submit_answer_core(data, mode):
     answer=(data.get('answer') or '').strip()
     audio_data=data.get('audio_data')
     if audio_data and not answer:
-        lang=LANGUAGES.get(s['selected_language'], LANGUAGES['English'])['code']
-        answer=transcribe_audio(audio_data, lang) or ""
+        lang = lang_code_for_session(s)
+        answer = transcribe_audio(audio_data, lang) or ""
 
     rephrase_needed = (not answer) or len(answer)<20
     live_fb = get_live_feedback_tech(s['current_question'], answer) if mode=='tech' else get_live_feedback_normal(s['current_question'], answer, s['interviewer_personality'])
