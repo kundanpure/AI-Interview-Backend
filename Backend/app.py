@@ -25,11 +25,11 @@ CORS(
 )
 
 # ---------- Config ----------
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 SERVER_GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 SERVER_GEMINI_TECH_KEY = os.getenv("GEMINI_TECH_API_KEY", "") or SERVER_GEMINI_KEY
 
-# Enforce BYOK: set to 'all' (require keys for both rounds), 'tech' (require for tech only), or 'none'
+# BYOK: 'all' (both rounds need client keys), 'tech' (tech only), 'none'
 REQUIRE_CLIENT_KEYS = os.getenv("REQUIRE_CLIENT_KEYS", "tech").lower()
 
 def require_key_for(mode:str)->bool:
@@ -40,7 +40,7 @@ def require_key_for(mode:str)->bool:
 def gemini_url(key: str, model: str = DEFAULT_MODEL) -> str:
     return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 
-# In-memory sessions (swap with DB/Redis in prod)
+# In-memory sessions
 sessions = {}
 
 # ---------- Helpers ----------
@@ -50,8 +50,27 @@ def normalize_experience(exp):
     if any(k in e for k in ["fresher","campus","intern","entry"]): return "Entry-level"
     return "Experienced"
 
+# JSON fence cleaner + extractor (stops ```json leaks)
+def _clean_json_text(raw: str) -> str:
+    txt = (raw or "").strip()
+    txt = re.sub(r"^```(?:json)?\s*", "", txt, flags=re.IGNORECASE)  # leading fence
+    txt = re.sub(r"\s*```$", "", txt)                               # trailing fence
+    return txt
+
+def extract_json_object(raw: str):
+    cleaned = _clean_json_text(raw)
+    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if not m:
+        return None
+    block = m.group(0)
+    try:
+        return json.loads(block)
+    except Exception:
+        return None
+
 INTERVIEW_PHASES = {
     "welcome": {"questions": lambda exp: 1, "duration": 60, "description": "Greeting + self-intro"},
+    # changed to 10 / 15 like you wanted
     "conversation": {"questions": lambda exp: 10 if normalize_experience(exp) == "Entry-level" else 15, "duration": 900, "description": "Main discussion"},
     "closing": {"questions": lambda exp: 1, "duration": 60, "description": "Wrap-up"}
 }
@@ -87,7 +106,6 @@ def validate_request_data(data, required_fields):
     return True, "Valid"
 
 def _client_key_from_headers():
-    # Both can be sent; we’ll pick per-mode below
     return request.headers.get('X-Gemini-Key'), request.headers.get('X-Gemini-Tech-Key')
 
 def create_session(mode='normal', key_normal=None, key_tech=None):
@@ -113,7 +131,6 @@ def create_session(mode='normal', key_normal=None, key_tech=None):
         'question_memory': [],
         'did_opening': False,
         'desired_tech_domains': TECH_DOMAINS_MASTER.copy(),
-        # BYOK overrides for the session
         'key_override_normal': key_normal,
         'key_override_tech': key_tech
     }
@@ -121,7 +138,6 @@ def create_session(mode='normal', key_normal=None, key_tech=None):
 
 def _resolve_key(session_id, which='normal'):
     s = sessions.get(session_id, {})
-    # if required, client key must be present
     if which == 'tech':
         key = s.get('key_override_tech') or (None if require_key_for('tech') else SERVER_GEMINI_TECH_KEY)
     else:
@@ -154,7 +170,7 @@ def _global_preflight_ok():
         resp.headers['Access-Control-Allow-Credentials'] = 'true'
         resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Gemini-Key, X-Gemini-Tech-Key'
         resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-        return resp  # <-- short-circuit before routing (prevents 404)
+        return resp
 
 # ---------- Turn generators ----------
 def _choose_next_tech_domain(s):
@@ -169,7 +185,7 @@ def get_next_turn_normal(session_id, force_rephrase=False):
     name = s['user_data'].get('name','Candidate'); role = s['user_data'].get('role','Software Engineer'); exp = normalize_experience(s['user_data'].get('experience','Entry-level'))
     recent = s['conversation_history'][-4:]
     tail = "\n".join([f"Q: {x['q']}\nA: {x.get('a','') or '[no answer]'}" for x in recent])
-    disallowed = s['asked_topics'][-6:]; recent_q = s['question_memory'][-6:]
+    disallowed = s['asked_topics'][-8:]; recent_q = s['question_memory'][-8:]
 
     if not s['did_opening']:
         opener = random.choice(p['openers'])
@@ -179,7 +195,9 @@ THIS TURN ONLY:
 - Warm greeting (one sentence), e.g., "{opener}"
 - Friendly tone (one sentence)
 - Invite self-introduction (one sentence)
-Return JSON: {{"message":"<say>","topic":"opening-rapport","turn_type":"opening"}}
+
+Return strict JSON ONLY (no markdown/backticks, no extra text):
+{{"message":"<say>","topic":"opening-rapport","turn_type":"opening"}}
 """
     else:
         difficulty = "Ask an easier follow-up." if force_rephrase else ""
@@ -193,23 +211,28 @@ Recent conversation (newest first):
 - Avoid repeating topics: {disallowed}
 {difficulty}
 
-Return JSON: {{"message":"<line>","topic":"<label>","turn_type":"question"}}
+Return strict JSON ONLY (no markdown/backticks, no extra text):
+{{"message":"<line>","topic":"<label>","turn_type":"question"}}
 If closing, set turn_type to "closing".
 """
+
     for _ in range(5):
         try:
             raw = call_gemini(prompt, session_id=session_id, which='normal')
         except RuntimeError as e:
             if str(e) == "NO_API_KEY": raise
             logger.warning(f"Gemini(normal) call failed: {e}"); continue
-        m = re.search(r'\{.*\}', raw, re.DOTALL); obj=None
-        if m:
-            try: obj=json.loads(m.group(0))
-            except: obj=None
+
+        raw_clean = _clean_json_text(raw)
+        obj = extract_json_object(raw_clean)
+
         if not obj or 'message' not in obj:
-            text, topic, turn = raw.strip(), "general", ("opening" if not s['did_opening'] else "question")
+            text, topic, turn = raw_clean.strip(), "general", ("opening" if not s['did_opening'] else "question")
         else:
-            text=(obj.get('message') or "").strip(); topic=(obj.get('topic') or "general").strip(); turn=(obj.get('turn_type') or ("opening" if not s['did_opening'] else "question")).strip()
+            text = (obj.get('message') or "").strip()
+            topic = (obj.get('topic') or "general").strip()
+            turn = (obj.get('turn_type') or ("opening" if not s['did_opening'] else "question")).strip()
+
         if not text: continue
         if any(too_similar(text, q) for q in recent_q): continue
         if topic and any(topic.lower()==t.lower() for t in disallowed): continue
@@ -232,7 +255,7 @@ def get_next_turn_tech(session_id, force_rephrase=False):
 
     next_domain  = _choose_next_tech_domain(s)
     domain_label = TECH_DOMAIN_LABELS.get(next_domain, next_domain)
-    recent_q = s['question_memory'][-12:]  # larger window reduces repeats
+    recent_q = s['question_memory'][-12:]
 
     if not s['did_opening']:
         opener = random.choice(p['openers'])
@@ -245,45 +268,37 @@ THIS TURN ONLY:
 - Set expectations: "We'll focus on core CS and DSA." (one sentence)
 - Invite brief technical background (one sentence).
 
-Return strict JSON:
+Return strict JSON ONLY (no markdown/backticks, no extra text):
 {{"message":"<say>","topic":"opening-technical","turn_type":"opening"}}
 """
     else:
-        # Guidance for each domain
         domain_rule = {
-                    'DSA': (
-                        "Ask a short, scenario-style question on a concrete sub-area (e.g., hash-table collision handling, "
-                        "sliding-window vs two-pointers, BFS vs Dijkstra on weighted graphs, union-find for connectivity). "
-                        "Include one constraint (memory cap or latency target). Require Big-O (typical vs worst) and one edge case. "
-                        "Avoid textbook definitions or generic 'what is the complexity of quicksort' style."
-                    ),
-                    'OOP': (
-                        "Focus on practical design: SOLID trade-offs, composition vs inheritance, interfaces vs abstract classes, "
-                        "or applying a pattern (factory/strategy/observer) to a tiny scenario. Ask for the trade-off and one failure mode. "
-                        "Avoid 'define polymorphism/encapsulation' style questions."
-                    ),
-                    'OS': (
-                        "Use a system scenario: scheduling under load (FCFS/SJF/RR trade-offs), deadlock conditions and prevention, "
-                        "synchronization with mutex/semaphore/monitor, or virtual memory (paging / replacement policy choice). "
-                        "Ask for investigation steps + a metric to watch. Avoid canonical 'process vs thread' phrasing."
-                    ),
-                    'CN': (
-                        "Ask from a production networking angle: TCP vs UDP choice, HTTP/1.1 vs HTTP/2 vs HTTP/3 implications, "
-                        "TLS handshake basics, congestion control (slow start), DNS caching, or routing intuition (BGP/OSPF). "
-                        "Frame it as diagnosing latency vs bandwidth vs throughput; ask for one concrete mitigation."
-                    ),
-                    'DBMS': (
-                        "Target indexing (B-tree vs hash, composite/covering) with a sample query shape, isolation levels/MVCC and anomalies, "
-                        "join strategies (nested-loop/hash/merge) or reading an EXPLAIN plan. Require the candidate to reference a table/key shape. "
-                        "Avoid canonical normalization openers (no 'what is normalization/1NF/2NF/3NF')."
-                    ),
-                    'SE': (
-                        "Ask about engineering practice with trade-offs: SDLC choice, Agile ceremonies, test strategy (unit/integration/E2E), "
-                        "CI/CD failure investigation, observability (logs/metrics/traces), or microservices vs monolith boundaries. "
-                        "Anchor it in a small real scenario and ask for one measurable outcome."
-                    )
-                }.get(next_domain, "Ask a concise, scenario-style CS fundamentals question with one constraint and request the key trade-off.")
-
+            'DSA': (
+                "Ask a short scenario question (e.g., collision strategies in hash tables, sliding-window vs two-pointers, "
+                "BFS vs Dijkstra on weighted graphs, union-find). Include one constraint (memory cap or latency) and require Big-O "
+                "for typical & worst case plus one edge case. Avoid generic textbook definitions."
+            ),
+            'OOP': (
+                "Practical design trade-offs: SOLID, composition vs inheritance, interface vs abstract, or apply factory/strategy/observer "
+                "to a tiny scenario. Ask for a trade-off and one failure mode. Avoid 'define polymorphism' type."
+            ),
+            'OS': (
+                "System scenario: scheduling under load (FCFS/SJF/RR), deadlock prevention, synchronization with mutex/semaphore/monitor, "
+                "or virtual memory/replacement policy. Ask investigation steps and one metric. Avoid 'process vs thread' phrasing."
+            ),
+            'CN': (
+                "Production networking: pick TCP vs UDP, HTTP/1.1 vs 2 vs 3 implications, TLS handshake basics, congestion control, DNS caching, "
+                "routing intuition. Frame as diagnosing latency vs bandwidth; ask one concrete mitigation."
+            ),
+            'DBMS': (
+                "Indexing (B-Tree vs hash, composite/covering) with a sample query, isolation levels/MVCC and anomalies, join strategies, or EXPLAIN plan. "
+                "Require referencing a table/key shape. Avoid 'what is normalization' openers."
+            ),
+            'SE': (
+                "Engineering practice: SDLC choice, Agile ceremonies, test strategy (unit/integration/E2E), CI/CD failure, observability, "
+                "microservices vs monolith. Anchor to a tiny real scenario; ask for one measurable outcome."
+            )
+        }.get(next_domain, "Ask a concise, scenario-style CS fundamentals question with one constraint and a trade-off.")
 
         diff_line = "Ask an easier confidence-building variant." if force_rephrase else "Slightly escalate if they seem confident."
 
@@ -293,26 +308,26 @@ You are {p['name']} ({p['style']}), TECHNICAL interviewer for {name} (role: {rol
 Recent conversation (newest first):
 {tail}
 
-Candidate's last answer (for intent):
+Candidate's last answer:
 \"\"\"{last_answer}\"\"\"
 
 - Topic: {domain_label}
 - Guidance: {domain_rule}
 - {diff_line}
 
-Follow-up behavior (obey strictly):
-- If they asked for clarification / said they didn't understand / or the answer is empty/very short:
-  Acknowledge briefly, then restate a simpler version of the SAME-TOPIC question.
-- If they said they are confident / it's easy:
+Follow-up rules (obey strictly):
+- If they asked for clarification / didn't understand / or the answer is empty/very short:
+  Acknowledge, then restate a simpler SAME-TOPIC variant.
+- If they said they are confident:
   Ask ONE deeper SAME-TOPIC follow-up (edge cases, Big-O trade-offs, memory, failure modes).
 - Otherwise:
   Ask the next question within {domain_label}.
 
 Constraints:
-- 1–2 sentences total; exactly one question; natural, human tone.
+- 1–2 sentences total; exactly one question; natural tone.
 - Stay on the SAME topic when clarifying or deepening.
 
-Return strict JSON:
+Return strict JSON ONLY (no markdown/backticks, no extra text):
 {{"message":"<one or two sentences>","topic":"{next_domain}","turn_type":"question"}}
 """
 
@@ -320,39 +335,27 @@ Return strict JSON:
         try:
             raw = call_gemini(prompt, session_id=session_id, which='tech', max_tokens=220, temperature=0.85)
         except RuntimeError as e:
-            if str(e) == "NO_API_KEY":
-                raise
-            logger.warning(f"Gemini(tech) call failed: {e}")
-            continue
+            if str(e) == "NO_API_KEY": raise
+            logger.warning(f"Gemini(tech) call failed: {e}"); continue
 
-        m = re.search(r'\{.*\}', raw, re.DOTALL)
-        obj = None
-        if m:
-            try:
-                obj = json.loads(m.group(0))
-            except Exception:
-                obj = None
+        raw_clean = _clean_json_text(raw)
+        obj = extract_json_object(raw_clean)
 
         if not obj or 'message' not in obj:
-            text, topic, turn = raw.strip(), next_domain, ("opening" if not s['did_opening'] else "question")
+            text, topic, turn = raw_clean.strip(), next_domain, ("opening" if not s['did_opening'] else "question")
         else:
             text = (obj.get('message') or "").strip()
             topic = (obj.get('topic') or next_domain).strip()
             turn  = (obj.get('turn_type') or ("opening" if not s['did_opening'] else "question")).strip()
 
-        if not text:
-            continue
-        if any(too_similar(text, q) for q in recent_q):
-            continue
-
+        if not text: continue
+        if any(too_similar(text, q) for q in recent_q): continue
         return text, topic, turn
 
-    # Fallbacks
     if not s['did_opening']:
         return ("Welcome! We'll focus on core CS and DSA today. To start, could you briefly introduce your technical background?",
                 "opening-technical", "opening")
     return ("In databases, what are ACID properties and why do they matter in transaction-heavy systems?", "DBMS", "question")
-
 
 # ---------- Feedback & scoring ----------
 def analyze_pronunciation(text, role="Software Engineer"):
@@ -483,7 +486,7 @@ def start_interview_core(data, mode):
     s=sessions[sid]
     if s['mode'] != mode: return {'error':'Session mode mismatch'}, 400
 
-    # enforce BYOK at start if required
+    # BYOK enforcement
     if require_key_for(mode):
         key = _resolve_key(sid, which='tech' if mode=='tech' else 'normal')
         if not key: return {'error': 'API key required. Please paste your Gemini key in the setup screen.'}, 400
@@ -668,7 +671,6 @@ def route_create_session_tech():
     try:
         k_norm, k_tech = _client_key_from_headers()
         sid = create_session(mode='tech', key_normal=k_norm, key_tech=k_tech)
-        # If BYOK is required for tech, but no tech key provided, tell the client now
         if require_key_for('tech') and not (k_tech or k_norm):
             return jsonify({'session_id': sid, 'status':'warning', 'message':'Technical round requires a Gemini key. Please paste it in the setup.'}), 200
         return jsonify({'session_id': sid, 'status':'success', 'message':'Tech session created'}), 200
