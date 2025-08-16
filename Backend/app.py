@@ -15,10 +15,10 @@ try:
 except Exception:
     OpenAI = None
 
-# IMPORTANT: guard SpeechRecognition import for Python 3.13 where aifc was removed
+# Guarded import (Python 3.13 dropped aifc, SpeechRecognition imports it)
 try:
-    import speech_recognition as sr  # may fail on 3.13 due to aifc removal
-except Exception as e:
+    import speech_recognition as sr  # optional fallback only
+except Exception:
     sr = None
 
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# CORS for ALL /api/* routes + custom headers
 CORS(
     app,
     resources={r"/api/*": {"origins": "*"}},
@@ -44,7 +43,7 @@ SERVER_GEMINI_TECH_KEY = os.getenv("GEMINI_TECH_API_KEY", "") or SERVER_GEMINI_K
 STT_PROVIDER = (os.getenv("STT_PROVIDER", "openai") or "openai").lower()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# BYOK: 'all' (both rounds need client keys), 'tech' (tech only), 'none'
+# BYOK policy for Gemini calls
 REQUIRE_CLIENT_KEYS = os.getenv("REQUIRE_CLIENT_KEYS", "tech").lower()
 
 def require_key_for(mode:str)->bool:
@@ -189,7 +188,7 @@ def _global_preflight_ok():
         resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
         return resp
 
-# ---------- Language selection ----------
+# ---------- Language ----------
 def lang_code_for_session(s):
     selected = s.get('selected_language', 'English')
     persona_key = s.get('interviewer_personality', 'sarah')
@@ -199,7 +198,7 @@ def lang_code_for_session(s):
         return 'en-US'
     return LANGUAGES.get(selected, LANGUAGES['English'])['code']
 
-# ---------- Turn generators (unchanged core) ----------
+# ---------- Turns (same logic you had) ----------
 def _choose_next_tech_domain(s):
     desired = s.get('desired_tech_domains') or TECH_DOMAINS_MASTER
     already = [t for t in s['asked_topics'] if t in TECH_DOMAINS_MASTER]
@@ -303,9 +302,9 @@ Return strict JSON ONLY (no markdown/backticks, no extra text):
             'DSA': "Ask a short practical DSA scenario. Include a constraint; ask Big-O typical/worst + one edge case.",
             'OOP': "Ask a practical design trade-off. Include one failure mode.",
             'OS': "Ask a systems scenario under load. Ask for one metric and mitigation.",
-            'CN': "Ask a networking choice/diagnosis scenario. Ask for one concrete mitigation.",
-            'DBMS': "Ask indexing/transaction/isolation scenario. Refer to a table/key; avoid pure definitions.",
-            'SE': "Ask SDLC/testing/CI/CD/observability trade-offs anchored to a tiny scenario."
+            'CN': "Ask a networking diagnosis/choice; include one concrete mitigation.",
+            'DBMS': "Ask indexing/transaction/isolation scenario referencing a table/key.",
+            'SE': "Ask SDLC/testing/CI/CD/observability trade-offs in a tiny scenario."
         }.get(next_domain, "Ask a concise CS scenario with one constraint and trade-off.")
         diff_line = "Ask an easier confidence-building variant." if force_rephrase else "Slightly escalate if they seem confident."
 
@@ -322,14 +321,6 @@ Candidate's last answer:
 - Topic: {domain_label}
 - Guidance: {domain_rule}
 - {diff_line}
-
-Follow-up rules (obey strictly):
-- If they asked for clarification / didn't understand / or the answer is empty/very short:
-  Acknowledge, then restate a simpler SAME-TOPIC variant.
-- If they said they are confident:
-  Ask ONE deeper SAME-TOPIC follow-up (edge cases/trade-offs/memory/failure modes).
-- Otherwise:
-  Ask the next question within {domain_label}.
 
 Constraints:
 - 1–2 sentences total; exactly one question; natural tone.
@@ -364,7 +355,7 @@ Return strict JSON ONLY (no markdown/backticks, no extra text):
                 "opening-technical", "opening")
     return ("In databases, what are ACID properties and why do they matter in transaction-heavy systems?", "DBMS", "question")
 
-# ---------- Feedback, scoring (unchanged) ----------
+# ---------- Feedback & scoring (same) ----------
 def analyze_pronunciation(text, role="Software Engineer"):
     feedback=[]; terms={"Software Engineer":{'algorithm':'AL-guh-rith-um','database':'DAY-tuh-bays','api':'AY-pee-eye','debugging':'dee-BUG-ing','scalability':'skay-luh-BIL-i-tee'},
                         "Data Engineer":{'sql':'ESS-kyoo-EL','etl':'EE-tee-EL','pipeline':'PIPE-line','hadoop':'HAY-doop','spark':'SPARK'}}
@@ -463,7 +454,16 @@ def calculate_enhanced_score(history):
     return round(min(avg,10),1)
 
 # ---------- STT providers ----------
-def _transcribe_openai_wav(path):
+def _choose_suffix_from_dataurl_header(header: str) -> str:
+    header = (header or "").lower()
+    if "audio/webm" in header: return ".webm"
+    if "audio/ogg" in header:  return ".ogg"
+    if "audio/mpeg" in header: return ".mp3"
+    if "audio/mp4" in header:  return ".mp4"
+    if "audio/wav" in header or "audio/x-wav" in header or "wav" in header: return ".wav"
+    return ".webm"  # safe default for MediaRecorder
+
+def _transcribe_openai_file(path):
     if not OpenAI or not OPENAI_API_KEY:
         return None
     try:
@@ -472,8 +472,7 @@ def _transcribe_openai_wav(path):
             resp = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=f,
-                response_format="json",
-                language=None
+                response_format="json"
             )
         txt = getattr(resp, "text", None) or (resp.get("text") if isinstance(resp, dict) else None)
         return (txt or "").strip()
@@ -485,6 +484,10 @@ def _transcribe_google_sr(path, language):
     if sr is None:
         logger.warning("SpeechRecognition not available on this Python version.")
         return ""
+    # google_sr only handles (L)PCM WAV well
+    if not path.lower().endswith(".wav"):
+        logger.warning("Google SR fallback requires WAV. Received non-WAV; skipping.")
+        return ""
     rec = sr.Recognizer()
     rec.dynamic_energy_threshold = True
     rec.energy_threshold = 250
@@ -492,38 +495,38 @@ def _transcribe_google_sr(path, language):
         with sr.AudioFile(path) as source:
             rec.adjust_for_ambient_noise(source, duration=0.4)
             audio = rec.record(source)
-        try:
-            return rec.recognize_google(audio, language=language).strip()
-        except Exception as e:
-            logger.warning(f"Google SR failed: {e}")
-            return ""
+        return rec.recognize_google(audio, language=language).strip()
     except Exception as e:
-        logger.error(f"ASR error: {e}")
+        logger.warning(f"Google SR failed: {e}")
         return ""
 
 def transcribe_audio(audio_data, language='en-US'):
     """
-    Accepts a DataURL string or raw bytes (WAV), writes to temp WAV, then:
-    - If STT_PROVIDER=openai and OPENAI_API_KEY set: use Whisper API.
-    - Else fallback to SpeechRecognition's Google SR (only if available).
+    Accepts either a DataURL string (e.g., 'data:audio/webm;base64,...')
+    or raw bytes. Saves with a suffix that matches the detected mime.
+    Prefers Whisper (OpenAI). Falls back to google_sr only for WAV.
     """
     try:
-        if isinstance(audio_data, str):
-            if ',' in audio_data:
-                audio_data = audio_data.split(',')[1]
-            audio_bytes = base64.b64decode(audio_data)
-        else:
+        header = ""
+        if isinstance(audio_data, str) and audio_data.startswith("data:"):
+            header, b64 = audio_data.split(",", 1)
+            audio_bytes = base64.b64decode(b64)
+            suffix = _choose_suffix_from_dataurl_header(header)
+        elif isinstance(audio_data, (bytes, bytearray)):
             audio_bytes = audio_data
+            suffix = ".webm"
+        else:
+            return ""
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(audio_bytes)
             tmp_path = tmp.name
 
         try:
             if STT_PROVIDER == "openai" and OPENAI_API_KEY:
-                txt = _transcribe_openai_wav(tmp_path)
+                txt = _transcribe_openai_file(tmp_path)
                 if txt: return txt
-            # fallback
+            # fallback (WAV only)
             return _transcribe_google_sr(tmp_path, language=language) or ""
         finally:
             try: os.unlink(tmp_path)

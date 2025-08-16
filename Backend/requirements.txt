@@ -3,6 +3,6 @@ Flask-Cors==4.0.1
 python-dotenv==1.0.1
 requests==2.32.3
 openai>=1.37.0
-# Optional fallback if you later want STT_PROVIDER=google_sr on Python <=3.12
+# Optional fallback only (ignored on Py3.13 due to guarded import)
 SpeechRecognition==3.10.4
 gunicorn==22.0.0
