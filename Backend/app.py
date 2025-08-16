@@ -10,6 +10,12 @@ import os, time, json, re, base64, uuid, logging, random
 from datetime import datetime
 from difflib import SequenceMatcher
 
+# Optional: OpenAI Whisper provider
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -28,6 +34,10 @@ CORS(
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 SERVER_GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 SERVER_GEMINI_TECH_KEY = os.getenv("GEMINI_TECH_API_KEY", "") or SERVER_GEMINI_KEY
+
+# STT provider: "openai" (recommended) or "google_sr"
+STT_PROVIDER = (os.getenv("STT_PROVIDER", "openai") or "openai").lower()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # BYOK: 'all' (both rounds need client keys), 'tech' (tech only), 'none'
 REQUIRE_CLIENT_KEYS = os.getenv("REQUIRE_CLIENT_KEYS", "tech").lower()
@@ -81,7 +91,6 @@ INTERVIEWER_PERSONALITIES = {
     'arjun': {'name': 'Arjun', 'emoji': '👨🏽‍💼', 'style': 'calm and structured',   'openers': ["Hello, welcome.","Nice to meet you.","Thanks for joining in."], 'gender': 'male',   'accent': 'en-IN'}
 }
 
-# Region-aware codes for Google SR
 LANGUAGES = {
     'English': {'code':'en-US'},
     'Hindi':   {'code':'hi-IN'},
@@ -163,7 +172,6 @@ def call_gemini(prompt, *, session_id, which='normal', max_tokens=600, temperatu
     data = r.json()
     return data['candidates'][0]['content']['parts'][0]['text'].strip()
 
-# ---------- Preflight: ensure no 404 on OPTIONS ----------
 @app.before_request
 def _global_preflight_ok():
     if request.method == 'OPTIONS' and request.path.startswith('/api/'):
@@ -176,20 +184,17 @@ def _global_preflight_ok():
         resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
         return resp
 
-# ---------- Language selection for SR ----------
+# ---------- Language selection ----------
 def lang_code_for_session(s):
-    # If user picked English, respect the interviewer accent (en-IN, en-GB, en-US)
     selected = s.get('selected_language', 'English')
     persona_key = s.get('interviewer_personality', 'sarah')
     accent = INTERVIEWER_PERSONALITIES.get(persona_key, {}).get('accent', 'en-US')
-
     if selected == 'English':
-        if accent in ('en-IN', 'en-GB', 'en-US'):
-            return accent
+        if accent in ('en-IN','en-GB','en-US'): return accent
         return 'en-US'
     return LANGUAGES.get(selected, LANGUAGES['English'])['code']
 
-# ---------- Turn generators ----------
+# ---------- Turn generation (same as your version) ----------
 def _choose_next_tech_domain(s):
     desired = s.get('desired_tech_domains') or TECH_DOMAINS_MASTER
     already = [t for t in s['asked_topics'] if t in TECH_DOMAINS_MASTER]
@@ -290,33 +295,13 @@ Return strict JSON ONLY (no markdown/backticks, no extra text):
 """
     else:
         domain_rule = {
-            'DSA': (
-                "Ask a short scenario question (e.g., collision strategies in hash tables, sliding-window vs two-pointers, "
-                "BFS vs Dijkstra on weighted graphs, union-find). Include one constraint (memory cap or latency) and require Big-O "
-                "for typical & worst case plus one edge case. Avoid generic textbook definitions."
-            ),
-            'OOP': (
-                "Practical design trade-offs: SOLID, composition vs inheritance, interface vs abstract, or apply factory/strategy/observer "
-                "to a tiny scenario. Ask for a trade-off and one failure mode. Avoid 'define polymorphism' type."
-            ),
-            'OS': (
-                "System scenario: scheduling under load (FCFS/SJF/RR), deadlock prevention, synchronization with mutex/semaphore/monitor, "
-                "or virtual memory/replacement policy. Ask investigation steps and one metric. Avoid 'process vs thread' phrasing."
-            ),
-            'CN': (
-                "Production networking: pick TCP vs UDP, HTTP/1.1 vs 2 vs 3 implications, TLS handshake basics, congestion control, DNS caching, "
-                "routing intuition. Frame as diagnosing latency vs bandwidth; ask one concrete mitigation."
-            ),
-            'DBMS': (
-                "Indexing (B-Tree vs hash, composite/covering) with a sample query, isolation levels/MVCC and anomalies, join strategies, or EXPLAIN plan. "
-                "Require referencing a table/key shape. Avoid 'what is normalization' openers."
-            ),
-            'SE': (
-                "Engineering practice: SDLC choice, Agile ceremonies, test strategy (unit/integration/E2E), CI/CD failure, observability, "
-                "microservices vs monolith. Anchor to a tiny real scenario; ask for one measurable outcome."
-            )
-        }.get(next_domain, "Ask a concise, scenario-style CS fundamentals question with one constraint and a trade-off.")
-
+            'DSA': "Ask a short practical DSA scenario. Include a constraint; ask Big-O typical/worst + one edge case.",
+            'OOP': "Ask a practical design trade-off. Include one failure mode.",
+            'OS': "Ask a systems scenario under load. Ask for one metric and mitigation.",
+            'CN': "Ask a networking choice/diagnosis scenario. Ask for one concrete mitigation.",
+            'DBMS': "Ask indexing/transaction/isolation scenario. Refer to a table/key; avoid pure definitions.",
+            'SE': "Ask SDLC/testing/CI/CD/observability trade-offs anchored to a tiny scenario."
+        }.get(next_domain, "Ask a concise CS scenario with one constraint and trade-off.")
         diff_line = "Ask an easier confidence-building variant." if force_rephrase else "Slightly escalate if they seem confident."
 
         prompt = f"""
@@ -337,13 +322,12 @@ Follow-up rules (obey strictly):
 - If they asked for clarification / didn't understand / or the answer is empty/very short:
   Acknowledge, then restate a simpler SAME-TOPIC variant.
 - If they said they are confident:
-  Ask ONE deeper SAME-TOPIC follow-up (edge cases, Big-O trade-offs, memory, failure modes).
+  Ask ONE deeper SAME-TOPIC follow-up (edge cases/trade-offs/memory/failure modes).
 - Otherwise:
   Ask the next question within {domain_label}.
 
 Constraints:
 - 1–2 sentences total; exactly one question; natural tone.
-- Stay on the SAME topic when clarifying or deepening.
 
 Return strict JSON ONLY (no markdown/backticks, no extra text):
 {{"message":"<one or two sentences>","topic":"{next_domain}","turn_type":"question"}}
@@ -375,7 +359,7 @@ Return strict JSON ONLY (no markdown/backticks, no extra text):
                 "opening-technical", "opening")
     return ("In databases, what are ACID properties and why do they matter in transaction-heavy systems?", "DBMS", "question")
 
-# ---------- Feedback & scoring ----------
+# ---------- Feedback & scoring (unchanged) ----------
 def analyze_pronunciation(text, role="Software Engineer"):
     feedback=[]; terms={"Software Engineer":{'algorithm':'AL-guh-rith-um','database':'DAY-tuh-bays','api':'AY-pee-eye','debugging':'dee-BUG-ing','scalability':'skay-luh-BIL-i-tee'},
                         "Data Engineer":{'sql':'ESS-kyoo-EL','etl':'EE-tee-EL','pipeline':'PIPE-line','hadoop':'HAY-doop','spark':'SPARK'}}
@@ -387,20 +371,20 @@ def analyze_pronunciation(text, role="Software Engineer"):
         if any(w in words for w in ['um','uh','like']): feedback.append("💡 Try a brief pause instead of filler words—it sounds more confident.")
     return feedback
 
-def get_live_feedback_normal(question, answer, personality):
-    if not answer or not answer.strip(): return "Totally fine—take your time and tell a short story about your work."
-    L=len(answer.strip()); fb=["Nice. "]
+def get_live_feedback_normal(q, a, _): 
+    if not a or not a.strip(): return "Totally fine—take your time and tell a short story about your work."
+    L=len(a.strip()); fb=["Nice. "]
     if L<20: fb.append("Add one concrete example or result.")
     elif L>500: fb.append("Great detail—wrap with a quick summary.")
     else: fb.append("Good pacing.")
-    if question and answer:
-        qk=set(re.findall(r"\b[\w']+\b", question.lower())); ak=set(re.findall(r"\b[\w']+\b", answer.lower()))
+    if q and a:
+        qk=set(re.findall(r"\b[\w']+\b", q.lower())); ak=set(re.findall(r"\b[\w']+\b", a.lower()))
         if len(qk & ak)/max(len(qk) or 1,1) < 0.3: fb.append(" Address the core more directly.")
     return "".join(fb)
 
-def get_live_feedback_tech(question, answer):
-    if not answer or not answer.strip(): return "Outline your reasoning first (definition → key idea → example)."
-    tips=[]; a=answer.lower()
+def get_live_feedback_tech(q, a):
+    if not a or not a.strip(): return "Outline your reasoning first (definition → key idea → example)."
+    tips=[]; a=a.lower()
     if any(x in a for x in ['time complexity','space complexity','o(','o(n','o(log','big-o']): tips.append("Good: mention typical & worst-case complexity.")
     if any(x in a for x in ['deadlock','race condition','synchronization','mutex','semaphore']): tips.append("Nice systems angle; add one mitigation.")
     if any(x in a for x in ['acid','isolation','index','join','normalization']): tips.append("DB point noted; add a quick example.")
@@ -473,12 +457,49 @@ def calculate_enhanced_score(history):
     if len(answered)/len(history) >= 0.8: avg += 0.5
     return round(min(avg,10),1)
 
-def transcribe_audio(audio_data, language='en-US'):
+# ---------- STT providers ----------
+def _transcribe_openai_wav(path):
+    if not OpenAI or not OPENAI_API_KEY:
+        return None
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        # whisper-1 is broadly available & robust
+        with open(path, "rb") as f:
+            resp = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                response_format="json",
+                language=None  # let it auto-detect unless you want to force
+            )
+        txt = getattr(resp, "text", None) or (resp.get("text") if isinstance(resp, dict) else None)
+        return (txt or "").strip()
+    except Exception as e:
+        logger.warning(f"OpenAI STT failed: {e}")
+        return None
+
+def _transcribe_google_sr(path, language):
     rec = sr.Recognizer()
-    # More tolerant, mobile-friendly defaults
     rec.dynamic_energy_threshold = True
     rec.energy_threshold = 250
+    try:
+        with sr.AudioFile(path) as source:
+            rec.adjust_for_ambient_noise(source, duration=0.4)
+            audio = rec.record(source)
+        try:
+            return rec.recognize_google(audio, language=language).strip()
+        except Exception as e:
+            logger.warning(f"Google SR failed: {e}")
+            return ""
+    except Exception as e:
+        logger.error(f"ASR error: {e}")
+        return ""
 
+def transcribe_audio(audio_data, language='en-US'):
+    """
+    Accepts a DataURL string or raw bytes (WAV), writes to temp WAV, then:
+    - If STT_PROVIDER=openai and OPENAI_API_KEY set: use Whisper API.
+    - Else fallback to SpeechRecognition's Google SR.
+    """
     try:
         if isinstance(audio_data, str):
             if ',' in audio_data:
@@ -492,25 +513,19 @@ def transcribe_audio(audio_data, language='en-US'):
             tmp_path = tmp.name
 
         try:
-            with sr.AudioFile(tmp_path) as source:
-                # Slightly longer calibration helps noise/room correction
-                rec.adjust_for_ambient_noise(source, duration=0.4)
-                audio = rec.record(source)
-            try:
-                return rec.recognize_google(audio, language=language)
-            except Exception as e:
-                logger.warning(f"Google SR failed: {e}")
-                return ""
+            if STT_PROVIDER == "openai" and OPENAI_API_KEY:
+                txt = _transcribe_openai_wav(tmp_path)
+                if txt: return txt
+            # fallback
+            return _transcribe_google_sr(tmp_path, language=language) or ""
         finally:
-            try:
-                os.unlink(tmp_path)
-            except:
-                pass
+            try: os.unlink(tmp_path)
+            except: pass
     except Exception as e:
-        logger.error(f"ASR error: {e}")
+        logger.error(f"ASR outer error: {e}")
         return ""
 
-# ---------- Shared handlers ----------
+# ---------- Core handlers ----------
 def start_interview_core(data, mode):
     ok,msg = validate_request_data(data, ['session_id'])
     if not ok: return {'error': msg}, 400
@@ -549,7 +564,7 @@ def start_interview_core(data, mode):
 def submit_answer_core(data, mode):
     ok,msg = validate_request_data(data, ['session_id'])
     if not ok: return {'error': msg}, 400
-    sid=data['session_id']; 
+    sid=data['session_id']
     if sid not in sessions: return {'error':'Invalid session ID'}, 400
     s=sessions[sid]
     if not s.get('interview_started', False): return {'error':'Interview not started'}, 400
@@ -560,7 +575,7 @@ def submit_answer_core(data, mode):
     audio_data=data.get('audio_data')
     if audio_data and not answer:
         lang = lang_code_for_session(s)
-        answer = transcribe_audio(audio_data, lang) or ""
+        answer = transcribe_audio(audio_data, language=lang) or ""
 
     rephrase_needed = (not answer) or len(answer)<20
     live_fb = get_live_feedback_tech(s['current_question'], answer) if mode=='tech' else get_live_feedback_normal(s['current_question'], answer, s['interviewer_personality'])
@@ -599,7 +614,7 @@ def submit_answer_core(data, mode):
 def skip_question_core(data, mode):
     ok,msg = validate_request_data(data, ['session_id'])
     if not ok: return {'error': msg}, 400
-    sid=data['session_id']; 
+    sid=data['session_id']
     if sid not in sessions: return {'error':'Invalid session ID'}, 400
     s=sessions[sid]
     if not s.get('interview_started', False): return {'error':'Interview not started'}, 400
@@ -622,7 +637,7 @@ def skip_question_core(data, mode):
 def get_feedback_core(data, mode):
     ok,msg = validate_request_data(data, ['session_id'])
     if not ok: return {'error': msg}, 400
-    sid=data['session_id']; 
+    sid=data['session_id']
     if sid not in sessions: return {'error':'Invalid session ID'}, 400
     s=sessions[sid]
 
@@ -646,7 +661,7 @@ def get_feedback_core(data, mode):
             'phase_performance': phase_perf,'live_feedback': s['live_feedback'],'pronunciation_feedback': s['pronunciation_feedback'],
             'conversation_history': s['conversation_history'],'questions_answered': len(answered),'total_questions': total}, 200
 
-# ---------- Routes: NORMAL ----------
+# ---------- Routes ----------
 @app.route('/api/create-session', methods=['POST','OPTIONS'])
 def route_create_session_normal():
     try:
@@ -697,7 +712,6 @@ def route_get_feedback_normal():
         logger.error(f"get-feedback normal error: {e}")
         return jsonify({'error':'Failed to get feedback'}), 500
 
-# ---------- Routes: TECH ----------
 @app.route('/api/tech/create-session', methods=['POST','OPTIONS'])
 def route_create_session_tech():
     try:
@@ -750,7 +764,6 @@ def route_get_feedback_tech():
         logger.error(f"get-feedback tech error: {e}")
         return jsonify({'error':'Failed to get tech feedback'}), 500
 
-# ---------- Status ----------
 @app.route('/api/health', methods=['GET','OPTIONS'])
 def route_health():
     normal = sum(1 for s in sessions.values() if s.get('mode')=='normal')
