@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 import requests
-import speech_recognition as sr
 import tempfile
 from dotenv import load_dotenv
 load_dotenv()
@@ -15,6 +14,12 @@ try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
+
+# IMPORTANT: guard SpeechRecognition import for Python 3.13 where aifc was removed
+try:
+    import speech_recognition as sr  # may fail on 3.13 due to aifc removal
+except Exception as e:
+    sr = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -194,7 +199,7 @@ def lang_code_for_session(s):
         return 'en-US'
     return LANGUAGES.get(selected, LANGUAGES['English'])['code']
 
-# ---------- Turn generation (same as your version) ----------
+# ---------- Turn generators (unchanged core) ----------
 def _choose_next_tech_domain(s):
     desired = s.get('desired_tech_domains') or TECH_DOMAINS_MASTER
     already = [t for t in s['asked_topics'] if t in TECH_DOMAINS_MASTER]
@@ -359,7 +364,7 @@ Return strict JSON ONLY (no markdown/backticks, no extra text):
                 "opening-technical", "opening")
     return ("In databases, what are ACID properties and why do they matter in transaction-heavy systems?", "DBMS", "question")
 
-# ---------- Feedback & scoring (unchanged) ----------
+# ---------- Feedback, scoring (unchanged) ----------
 def analyze_pronunciation(text, role="Software Engineer"):
     feedback=[]; terms={"Software Engineer":{'algorithm':'AL-guh-rith-um','database':'DAY-tuh-bays','api':'AY-pee-eye','debugging':'dee-BUG-ing','scalability':'skay-luh-BIL-i-tee'},
                         "Data Engineer":{'sql':'ESS-kyoo-EL','etl':'EE-tee-EL','pipeline':'PIPE-line','hadoop':'HAY-doop','spark':'SPARK'}}
@@ -463,13 +468,12 @@ def _transcribe_openai_wav(path):
         return None
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
-        # whisper-1 is broadly available & robust
         with open(path, "rb") as f:
             resp = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=f,
                 response_format="json",
-                language=None  # let it auto-detect unless you want to force
+                language=None
             )
         txt = getattr(resp, "text", None) or (resp.get("text") if isinstance(resp, dict) else None)
         return (txt or "").strip()
@@ -478,6 +482,9 @@ def _transcribe_openai_wav(path):
         return None
 
 def _transcribe_google_sr(path, language):
+    if sr is None:
+        logger.warning("SpeechRecognition not available on this Python version.")
+        return ""
     rec = sr.Recognizer()
     rec.dynamic_energy_threshold = True
     rec.energy_threshold = 250
@@ -498,7 +505,7 @@ def transcribe_audio(audio_data, language='en-US'):
     """
     Accepts a DataURL string or raw bytes (WAV), writes to temp WAV, then:
     - If STT_PROVIDER=openai and OPENAI_API_KEY set: use Whisper API.
-    - Else fallback to SpeechRecognition's Google SR.
+    - Else fallback to SpeechRecognition's Google SR (only if available).
     """
     try:
         if isinstance(audio_data, str):
@@ -525,7 +532,7 @@ def transcribe_audio(audio_data, language='en-US'):
         logger.error(f"ASR outer error: {e}")
         return ""
 
-# ---------- Core handlers ----------
+# ---------- Shared handlers ----------
 def start_interview_core(data, mode):
     ok,msg = validate_request_data(data, ['session_id'])
     if not ok: return {'error': msg}, 400
