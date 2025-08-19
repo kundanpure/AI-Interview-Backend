@@ -87,21 +87,6 @@ INTERVIEW_PHASES = {
     "closing": {"questions": lambda exp: 1, "duration": 60, "description": "Wrap-up"}
 }
 
-# >>> ADDED: Technical Depth phase injected into NORMAL flow
-INTERVIEW_PHASES.update({
-    "technical_depth": {
-        "questions": lambda exp: 4 if normalize_experience(exp) == "Entry-level" else 6,
-        "duration": 600,
-        "description": "Domain-specific deep dive"
-    }
-})
-
-# >>> ADDED: Explicit phase order per mode
-PHASE_FLOW = {
-    "normal": ["welcome", "conversation", "technical_depth", "closing"],
-    "tech":   ["welcome", "conversation", "closing"]
-}
-
 INTERVIEWER_PERSONALITIES = {
     'sarah': {'name': 'Sarah', 'emoji': '👩‍💼', 'style': 'warm and encouraging', 'openers': ["Lovely to meet you.","Thanks for joining.","I’m glad you’re here."], 'gender': 'female', 'accent': 'en-US'},
     'john':  {'name': 'John',  'emoji': '👨‍💼', 'style': 'professional and direct', 'openers': ["Good to meet you.","Thanks for the time.","Appreciate you being here."], 'gender': 'male',   'accent': 'en-US'},
@@ -164,9 +149,7 @@ def create_session(mode='normal', key_normal=None, key_tech=None):
         'did_opening': False,
         'desired_tech_domains': TECH_DOMAINS_MASTER.copy(),
         'key_override_normal': key_normal,
-        'key_override_tech': key_tech,
-        # >>> ADDED: selected domain for normal mode depth phase
-        'selected_domain': 'General'
+        'key_override_tech': key_tech
     }
     return sid
 
@@ -372,95 +355,6 @@ Return strict JSON ONLY (no markdown/backticks, no extra text):
                 "opening-technical", "opening")
     return ("In databases, what are ACID properties and why do they matter in transaction-heavy systems?", "DBMS", "question")
 
-# >>> ADDED: Domain-aware depth questions for NORMAL mode
-def get_next_turn_depth_normal(session_id, force_rephrase=False):
-    s = sessions[session_id]
-    p = INTERVIEWER_PERSONALITIES.get(s['interviewer_personality'], INTERVIEWER_PERSONALITIES['sarah'])
-    name = s['user_data'].get('name','Candidate')
-    role = s['user_data'].get('role','Software Engineer')
-    exp  = normalize_experience(s['user_data'].get('experience','Entry-level'))
-    domain = (s.get('selected_domain') or 'General').strip()
-
-    recent = s['conversation_history'][-4:]
-    tail = "\n".join([f"Q: {x['q']}\nA: {x.get('a','') or '[no answer]'}" for x in recent])
-    last_answer = (recent[-1]['a'] if recent else '').strip()
-    recent_q = s['question_memory'][-12:]
-
-    guides = {
-        "Python":  "Ask about idiomatic Python, complexity trade-offs, and a small code/design scenario (e.g., iterators, async, typing).",
-        "Java":    "Ask about collections vs concurrency choice, JVM memory, or a small OOP design trade-off.",
-        "Web":     "Ask about REST vs GraphQL, caching/CDN, security (CORS/CSRF), or performance trade-off.",
-        "AI/ML":   "Ask about model choice, data leakage, eval metrics, or serving/latency trade-off.",
-        "DevOps":  "Ask CI/CD, container vs VM, observability (metrics/logs/traces), rollback strategy.",
-        "Android": "Ask lifecycle, Compose vs XML, offline-first sync, or performance/battery trade-off.",
-        "Data Engineering": "Ask batch vs streaming, partitioning, schema evolution, or cost/perf trade-off.",
-        "Cybersecurity": "Ask threat model, authn/z choice, least privilege, or secure-by-default trade-off.",
-        "General": "Ask a concise domain-agnostic scenario with one constraint and trade-off."
-    }
-    rule = guides.get(domain, guides["General"])
-    diff_line = "Ask an easier confidence-building variant." if force_rephrase else "Slightly escalate if they seem confident."
-
-    prompt = f"""
-You are {p['name']} ({p['style']}), interviewing {name} for {role} ({exp}).
-Phase: Technical Depth (domain: {domain})
-
-Recent conversation (newest first):
-{tail}
-
-Candidate's last answer:
-\"\"\"{last_answer}\"\"\"
-
-
-Guidance: {rule}
-{diff_line}
-
-Constraints:
-- 1–2 sentences total; exactly one question; natural tone.
-
-Return strict JSON ONLY (no markdown/backticks, no extra text):
-{{"message":"<one or two sentences>","topic":"{domain}","turn_type":"question"}}
-"""
-    for _ in range(6):
-        try:
-            raw = call_gemini(prompt, session_id=session_id, which='normal', max_tokens=220, temperature=0.85)
-        except RuntimeError as e:
-            logger.warning(f"Gemini(depth-normal) call failed: {e}")
-            continue
-
-        raw_clean = _clean_json_text(raw)
-        obj = extract_json_object(raw_clean)
-        if not obj or 'message' not in obj:
-            text, topic, turn = raw_clean.strip(), domain, "question"
-        else:
-            text = (obj.get('message') or "").strip()
-            topic = (obj.get('topic') or domain).strip()
-            turn  = (obj.get('turn_type') or "question").strip()
-
-        if not text:
-            continue
-        if any(too_similar(text, q) for q in recent_q):
-            continue
-        return text, topic, turn
-
-    return (f"In {domain}, describe a recent problem you solved, the trade-offs you considered, and one thing you would do differently.",
-            domain, "question")
-
-# >>> ADDED: phase advancement helper
-def _advance_phase_if_needed(s, mode):
-    flow = PHASE_FLOW.get(mode, ["welcome","conversation","closing"])
-    cur = s['current_phase']
-    limit = INTERVIEW_PHASES[cur]["questions"](s['user_data'].get('experience'))
-    if s['phase_question_count'] >= limit:
-        try:
-            idx = flow.index(cur)
-        except ValueError:
-            idx = 0
-        if idx < len(flow) - 1:
-            s['current_phase'] = flow[idx + 1]
-            s['phase_question_count'] = 0
-            return True
-    return False
-
 # ---------- Feedback & scoring (same) ----------
 def analyze_pronunciation(text, role="Software Engineer"):
     feedback=[]; terms={"Software Engineer":{'algorithm':'AL-guh-rith-um','database':'DAY-tuh-bays','api':'AY-pee-eye','debugging':'dee-BUG-ing','scalability':'skay-luh-BIL-i-tee'},
@@ -658,8 +552,6 @@ def start_interview_core(data, mode):
     s['user_data']['experience']=normalize_experience(s['user_data'].get('experience'))
     s['interviewer_personality']=data.get('interviewer_personality','sarah')
     s['selected_language']=data.get('selected_language','English')
-    # >>> ADDED: read selected domain for normal depth phase (kept harmless for tech mode)
-    s['selected_domain'] = data.get('domain') or s['user_data'].get('domain') or s.get('selected_domain','General')
 
     if mode=='tech':
         tech_domains=data.get('tech_domains')
@@ -669,16 +561,12 @@ def start_interview_core(data, mode):
     s['interview_started']=True; s['start_time']=time.time()
     s['current_phase']="welcome"; s['did_opening']=False
 
-    # first opening question
     if mode=='tech': msg, topic, ttype = get_next_turn_tech(sid)
     else:            msg, topic, ttype = get_next_turn_normal(sid)
 
     s['current_question']=msg; s['question_counter']=1; s['phase_question_count']=1
     s['asked_topics'].append(topic); s['question_memory'].append(msg); s['did_opening']=True
-
-    # >>> ADDED: move to first active phase after welcome based on flow
-    flow = PHASE_FLOW[mode]
-    s['current_phase'] = flow[1] if len(flow) > 1 else "conversation"
+    s['current_phase']="conversation"
 
     return {'status':'success','question':msg,'phase':s['current_phase'],'question_counter':s['question_counter'],
             'interviewer': INTERVIEWER_PERSONALITIES[s['interviewer_personality']]}, 200
@@ -706,39 +594,25 @@ def submit_answer_core(data, mode):
     s['conversation_history'].append({'q': s['current_question'],'a': answer,'phase': s['current_phase'],'feedback': live_fb,'timestamp': datetime.now().isoformat(),'skipped': False})
     s['live_feedback'].append(live_fb); s['pronunciation_feedback'].extend(pron)
 
-    # >>> ADDED: phase advancement check after answering current question
-    _advance_phase_if_needed(s, mode)
-
     resp={'status':'success','feedback': live_fb,'pronunciation_tips': pron}
 
     if rephrase_needed and s.get('rephrase_count',0) < 2:
         s['rephrase_count']=s.get('rephrase_count',0)+1
-        if mode=='tech': 
-            msg, topic, ttype = get_next_turn_tech(sid, force_rephrase=True)
-        else:
-            if s['current_phase'] == 'technical_depth':
-                msg, topic, ttype = get_next_turn_depth_normal(sid, force_rephrase=True)
-            else:
-                msg, topic, ttype = get_next_turn_normal(sid, force_rephrase=True)
+        if mode=='tech': msg, topic, ttype = get_next_turn_tech(sid, force_rephrase=True)
+        else:            msg, topic, ttype = get_next_turn_normal(sid, force_rephrase=True)
         s['current_question']=msg; s['asked_topics'].append(topic); s['question_memory'].append(msg)
         resp.update({'question': msg,'phase': s['current_phase'],'question_counter': s['question_counter'],'rephrased': True,'interview_complete': False})
         return resp, 200
 
     s['rephrase_count']=0
-    limit_now = INTERVIEW_PHASES[s['current_phase']]["questions"](s['user_data'].get('experience'))
-    resp['interview_complete']=(s['current_phase']=="closing" and s['phase_question_count']>=limit_now)
+    limit=INTERVIEW_PHASES[s['current_phase']]["questions"](s['user_data'].get('experience'))
+    if s['phase_question_count'] >= limit: s['current_phase']="closing"
+    resp['interview_complete']=(s['current_phase']=="closing" and s['phase_question_count']>=limit)
 
     if not resp['interview_complete']:
-        if mode=='tech': 
-            msg, topic, ttype = get_next_turn_tech(sid)
-        else:
-            if s['current_phase'] == 'technical_depth':
-                msg, topic, ttype = get_next_turn_depth_normal(sid)
-            else:
-                msg, topic, ttype = get_next_turn_normal(sid)
-        if ttype=="closing":
-            s['current_phase']="closing"
-            s['phase_question_count']=0
+        if mode=='tech': msg, topic, ttype = get_next_turn_tech(sid)
+        else:            msg, topic, ttype = get_next_turn_normal(sid)
+        if ttype=="closing": s['current_phase']="closing"
         s['current_question']=msg; s['question_counter']+=1; s['phase_question_count']+=1
         s['asked_topics'].append(topic); s['question_memory'].append(msg)
         resp.update({'question': msg,'phase': s['current_phase'],'question_counter': s['question_counter']})
@@ -757,25 +631,14 @@ def skip_question_core(data, mode):
     if s['mode'] != mode: return {'error':'Session mode mismatch'}, 400
 
     s['conversation_history'].append({'q': s['current_question'],'a': "[SKIPPED]",'phase': s['current_phase'],'skipped': True,'timestamp': datetime.now().isoformat()})
+    limit=INTERVIEW_PHASES[s['current_phase']]["questions"](s['user_data'].get('experience'))
+    if s['phase_question_count'] >= limit: s['current_phase']="closing"
 
-    # >>> ADDED: phase advancement for skip path
-    _advance_phase_if_needed(s, mode)
-
-    resp={'status':'success','interview_complete': False}
-    limit_now = INTERVIEW_PHASES[s['current_phase']]["questions"](s['user_data'].get('experience'))
-    resp['interview_complete'] = (s['current_phase']=="closing" and s['phase_question_count']>=limit_now)
-
+    resp={'status':'success','interview_complete': (s['current_phase']=="closing" and s['phase_question_count']>=limit)}
     if not resp['interview_complete']:
-        if mode=='tech': 
-            msg, topic, ttype = get_next_turn_tech(sid)
-        else:
-            if s['current_phase'] == 'technical_depth':
-                msg, topic, ttype = get_next_turn_depth_normal(sid)
-            else:
-                msg, topic, ttype = get_next_turn_normal(sid)
-        if ttype=="closing":
-            s['current_phase']="closing"
-            s['phase_question_count']=0
+        if mode=='tech': msg, topic, ttype = get_next_turn_tech(sid)
+        else:            msg, topic, ttype = get_next_turn_normal(sid)
+        if ttype=="closing": s['current_phase']="closing"
         s['current_question']=msg; s['question_counter']+=1; s['phase_question_count']+=1
         s['asked_topics'].append(topic); s['question_memory'].append(msg)
         resp.update({'question': msg,'phase': s['current_phase'],'question_counter': s['question_counter']})
